@@ -1,6 +1,7 @@
 import os
 import unittest
 
+import dill
 from data_juicer.core.data import NestedDataset as Dataset
 
 from data_juicer.ops.mapper.video_ffmpeg_wrapped_mapper import \
@@ -63,6 +64,21 @@ class VideoFFmpegWrappedMapperTest(DataJuicerTestCaseBase):
                                       },
                                       capture_stderr=False)
         self._run_op(ds_list, tgt_list, op, np=2)
+
+    def test_invalid_filter_error_survives_worker_result_queue(self):
+        op = VideoFFmpegWrappedMapper('definitely_not_a_filter',
+                                      filter_kwargs={},
+                                      capture_stderr=True,
+                                      skip_op_error=False)
+
+        dataset = Dataset.from_list([{'videos': [self.vid1_path]}])
+        with self.assertRaises(RuntimeError) as context:
+            dataset.map(op.process, num_proc=1)
+
+        self.assertIn('FFmpeg execution failed', str(context.exception))
+        self.assertIn('definitely_not_a_filter', str(context.exception))
+        restored = dill.loads(dill.dumps(context.exception))
+        self.assertIn('FFmpeg execution failed', str(restored))
 
 
 if __name__ == '__main__':

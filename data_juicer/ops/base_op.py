@@ -26,6 +26,59 @@ TAGGING_OPS = Registry("Tagging Operators")
 ATTRIBUTION_FILTERS = Registry("Attribution Filters")
 DEFAULT_BATCH_SIZE = 1000
 
+FFMPEG_ERROR_STDERR_LIMIT = 4000
+
+
+def _decode_process_output(output):
+    if isinstance(output, bytes):
+        return output.decode("utf-8", "replace")
+    if output is None:
+        return ""
+    return str(output)
+
+
+def _is_ffmpeg_error(error):
+    return type(error).__module__ == "ffmpeg._run" and type(error).__name__ == "Error"
+
+
+def _ffmpeg_error_message(error):
+    stderr = _decode_process_output(getattr(error, "stderr", "")).strip()
+    if stderr:
+        # The generic ffmpeg.Error message hides stderr, which is also the part
+        # that becomes impossible to reconstruct through a multiprocess queue.
+        return f"FFmpeg execution failed: {stderr[-FFMPEG_ERROR_STDERR_LIMIT:]}"
+    return f"FFmpeg execution failed: {error}"
+
+
+def _convert_error_for_worker_queue(error):
+    if _is_ffmpeg_error(error):
+        converted = RuntimeError(_ffmpeg_error_message(error))
+        # Do not retain the original ffmpeg.Error: its custom __init__ makes it
+        # non-reconstructable by the exact exception path used by multiprocess.
+        converted.__cause__ = None
+        converted.__suppress_context__ = True
+        return converted
+
+    try:
+        import dill
+
+        # Serialization alone is not enough: ffmpeg.Error can be dumped and
+        # still fail while the receiver reconstructs it.
+        dill.loads(dill.dumps(error))
+    except Exception:
+        converted = RuntimeError(f"{type(error).__name__}: {error}")
+        converted.__cause__ = None
+        converted.__suppress_context__ = True
+        return converted
+
+    return error
+
+
+def _error_log_message(error):
+    if _is_ffmpeg_error(error):
+        return _ffmpeg_error_message(error)
+    return str(error)
+
 
 def convert_list_dict_to_dict_list(samples):
     # reconstruct samples from "list of dicts" to "dict of lists"
@@ -71,12 +124,15 @@ def catch_map_batches_exception(method, skip_op_error=False, op_name=None):
             return method(samples, *args, **kwargs)
         except Exception as e:
             if not skip_op_error:
-                raise
+                converted = _convert_error_for_worker_queue(e)
+                if converted is e:
+                    raise
+                raise converted from None
             import traceback
 
             from loguru import logger
 
-            logger.error(f"An error occurred in {op_name}: {e} -- {traceback.format_exc()}")
+            logger.error(f"An error occurred in {op_name}: {_error_log_message(e)} -- {traceback.format_exc()}")
             ret = {key: [] for key in samples.keys()}
             ret[Fields.stats] = []
             ret[Fields.source_file] = []
@@ -268,12 +324,15 @@ def catch_map_single_exception(method, return_sample=True, skip_op_error=False, 
                     return [res]
             except Exception as e:
                 if not skip_op_error:
-                    raise
+                    converted = _convert_error_for_worker_queue(e)
+                    if converted is e:
+                        raise
+                    raise converted from None
                 import traceback
 
                 from loguru import logger
 
-                logger.error(f"An error occurred in {op_name}: {e} -- {traceback.format_exc()}")
+                logger.error(f"An error occurred in {op_name}: {_error_log_message(e)} -- {traceback.format_exc()}")
                 ret = {key: [] for key in sample.keys()}
                 ret[Fields.stats] = []
                 ret[Fields.source_file] = []

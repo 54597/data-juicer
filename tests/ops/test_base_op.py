@@ -1,6 +1,8 @@
 import inspect
 import unittest
+from unittest.mock import patch
 
+import dill
 import numpy as np
 import pyarrow as pa
 
@@ -73,6 +75,27 @@ class ErrorMapper(Mapper):
     def process_single(self, sample):
         raise ValueError('intentional error')
 
+
+class UnpicklableError(RuntimeError):
+    def __reduce__(self):
+        raise TypeError('intentional unpicklable error')
+
+
+class _BrokenExceptionConstructor(Exception):
+    def __init__(self, cmd, stdout, stderr):
+        raise TypeError('missing required exception arguments')
+
+
+class SerializationOnlyError(RuntimeError):
+    def __reduce__(self):
+        return (_BrokenExceptionConstructor, ('ffmpeg', b'', b''))
+
+
+def make_ffmpeg_like_error(stderr=b'moov atom not found\n'):
+    ffmpeg_error_cls = type('Error', (Exception,), {'__module__': 'ffmpeg._run'})
+    error = ffmpeg_error_cls('ffmpeg', b'', stderr)
+    error.stderr = stderr
+    return error
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +193,55 @@ class CatchMapBatchesExceptionTest(DataJuicerTestCaseBase):
         with self.assertRaises(ValueError):
             wrapped({'text': ['hello']})
 
+    def test_ffmpeg_error_in_batched_map_is_dill_picklable(self):
+        def fn(samples):
+            raise make_ffmpeg_like_error(b'moov atom not found\n')
+
+        wrapped = catch_map_batches_exception(fn, skip_op_error=False)
+        with self.assertRaises(RuntimeError) as context:
+            wrapped({'text': ['hello']})
+
+        self.assertIn('moov atom not found', str(context.exception))
+        restored = dill.loads(dill.dumps(context.exception))
+        self.assertIn('moov atom not found', str(restored))
+
+    def test_unpicklable_error_in_batched_map_wraps_to_runtime_error(self):
+        def fn(samples):
+            raise UnpicklableError('original diagnostic')
+
+        wrapped = catch_map_batches_exception(fn, skip_op_error=False)
+        with self.assertRaises(RuntimeError) as context:
+            wrapped({'text': ['hello']})
+
+        self.assertIn('UnpicklableError: original diagnostic', str(context.exception))
+        restored = dill.loads(dill.dumps(context.exception))
+        self.assertIn('UnpicklableError: original diagnostic', str(restored))
+
+    def test_error_that_cannot_reconstruct_wraps_to_runtime_error(self):
+        def fn(samples):
+            raise SerializationOnlyError('original diagnostic')
+
+        wrapped = catch_map_batches_exception(fn, skip_op_error=False)
+        with self.assertRaises(RuntimeError) as context:
+            wrapped({'text': ['hello']})
+
+        self.assertIn('SerializationOnlyError: original diagnostic', str(context.exception))
+        restored = dill.loads(dill.dumps(context.exception))
+        self.assertIn('SerializationOnlyError: original diagnostic', str(restored))
+
+    def test_ffmpeg_error_in_skipped_batched_map_is_logged(self):
+        def fn(samples):
+            raise make_ffmpeg_like_error(b'moov atom not found\n')
+
+        wrapped = catch_map_batches_exception(fn, skip_op_error=True, op_name='test_op')
+        with patch('loguru.logger.error') as log_error:
+            result = wrapped({'text': ['hello'], 'other': ['x']})
+
+        self.assertEqual(result['text'], [])
+        log_error.assert_called_once()
+        logged_message = log_error.call_args.args[0]
+        self.assertIn('moov atom not found', logged_message)
+
     def test_error_skipped_returns_empty(self):
         def fn(samples):
             raise ValueError('boom')
@@ -230,6 +302,30 @@ class CatchMapSingleExceptionTest(DataJuicerTestCaseBase):
         wrapped = catch_map_single_exception(fn, skip_op_error=False)
         with self.assertRaises(ValueError):
             wrapped({'text': ['hello'], 'n': [1]})
+
+    def test_ffmpeg_error_in_batched_single_op_map_is_dill_picklable(self):
+        def fn(sample):
+            raise make_ffmpeg_like_error(b'Invalid data found when processing input\n')
+
+        wrapped = catch_map_single_exception(fn, skip_op_error=False)
+        with self.assertRaises(RuntimeError) as context:
+            wrapped({'text': ['hello'], 'n': [1]})
+
+        self.assertIn('Invalid data found when processing input', str(context.exception))
+        restored = dill.loads(dill.dumps(context.exception))
+        self.assertIn('Invalid data found when processing input', str(restored))
+
+    def test_ffmpeg_error_in_skipped_single_op_map_is_logged(self):
+        def fn(sample):
+            raise make_ffmpeg_like_error(b'Invalid data found when processing input\n')
+
+        wrapped = catch_map_single_exception(fn, skip_op_error=True, op_name='test')
+        with patch('loguru.logger.error') as log_error:
+            result = wrapped({'text': ['hello'], 'n': [1]})
+
+        self.assertEqual(result['text'], [])
+        log_error.assert_called_once()
+        self.assertIn('Invalid data found when processing input', log_error.call_args.args[0])
 
     def test_return_sample_false(self):
         def fn(sample):
